@@ -1,12 +1,15 @@
-use std::ffi::OsStr;
-
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_sidecar::{
     command::FfmpegCommand,
-    event::{FfmpegDuration, FfmpegEvent, FfmpegProgress, LogLevel, StreamTypeSpecificData},
+    event::{
+        AudioStream, FfmpegDuration, FfmpegEvent, FfmpegProgress, LogLevel, StreamTypeSpecificData,
+        VideoStream,
+    },
 };
-use humansize::ToF64;
 use indicatif::ProgressBar;
+use std::{ffi::OsStr, io, time::Duration};
+
+use super::file;
 
 pub enum VideoRes {
     R240p,
@@ -78,6 +81,24 @@ impl VideoRes {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoStat {
+    pub path: String,
+    pub video_stream: VideoStream,
+    pub audio_streams: Vec<AudioStream>,
+    pub duration: Duration,
+    pub file_size: u64,
+}
+
+#[derive(Debug)]
+pub enum VideoStatErr {
+    NoVideoStreamFound,
+    MultipleVideoStreamFound,
+    NoDurationFound,
+    FfmpegError(anyhow::Error),
+    FileError(io::Error),
+}
+
 pub struct VideoConfig {
     pub res: Option<VideoRes>,
     pub fps: Option<f64>,
@@ -86,19 +107,100 @@ pub struct VideoConfig {
 }
 
 pub struct VideoProcessParams {
-    pub input_path: String,
     pub output_path: String,
-    pub video_config: VideoConfig,
+    pub config: VideoConfig,
 }
 
-pub async fn process(params: VideoProcessParams, pb: ProgressBar) -> Result<()> {
+pub fn handle_ffmpeg_event_log(
+    level: LogLevel,
+    err: String,
+    ignore_no_input: bool,
+) -> Result<(), anyhow::Error> {
+    match level {
+        LogLevel::Fatal | LogLevel::Error => {
+            let e = err.split("[fatal] ").last().unwrap();
+            let expected = e == "At least one output file must be specified";
+
+            if expected && !ignore_no_input {
+                return Err(anyhow!("入力ファイルが指定されていません"));
+            }
+
+            Ok(())
+        }
+
+        LogLevel::Warning => Ok(()).inspect(|_| {
+            println!("警告: {}", err);
+        }),
+        _ => Ok(()),
+    }
+}
+
+pub async fn stat(input_path: String) -> Result<VideoStat, VideoStatErr> {
+    let mut runner = FfmpegCommand::new()
+        .input(input_path.clone())
+        .spawn()
+        .unwrap();
+
+    let mut input_duration_sec: Option<f64> = None;
+    let mut input_streams: Vec<StreamTypeSpecificData> = Vec::new();
+
+    for e in runner.iter().unwrap() {
+        match e {
+            FfmpegEvent::ParsedDuration(FfmpegDuration { duration, .. }) => {
+                input_duration_sec = Some(duration);
+            }
+            FfmpegEvent::ParsedInputStream(s) => {
+                input_streams.push(s.type_specific_data);
+            }
+            FfmpegEvent::Log(level, err) => {
+                handle_ffmpeg_event_log(level, err, true).map_err(VideoStatErr::FfmpegError)?;
+            }
+            _ => {
+                // println!("{:?}", e);
+            }
+        }
+    }
+
+    let mut video_streams = input_streams.iter().filter_map(|s| match s {
+        StreamTypeSpecificData::Video(v) => Some(v),
+        _ => None,
+    });
+
+    let video_stream = match video_streams.clone().count() {
+        0 => Err(VideoStatErr::NoVideoStreamFound),
+        1 => Ok(video_streams.next().unwrap().clone()),
+        _ => Err(VideoStatErr::MultipleVideoStreamFound),
+    }?;
+
+    let audio_streams = input_streams
+        .iter()
+        .filter_map(|a| match a {
+            StreamTypeSpecificData::Audio(a) => Some(a.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let duration_sec = input_duration_sec.ok_or(VideoStatErr::NoDurationFound)?;
+    let duration = Duration::from_secs_f64(duration_sec);
+
+    let file_size = file::calc_size(&input_path).map_err(VideoStatErr::FileError)?;
+
+    Ok(VideoStat {
+        path: input_path,
+        video_stream,
+        audio_streams,
+        duration,
+        file_size,
+    })
+}
+
+pub async fn process(stat: VideoStat, params: VideoProcessParams, pb: ProgressBar) -> Result<()> {
     let VideoProcessParams {
-        input_path,
         output_path,
-        video_config,
+        config,
     } = params;
 
-    let arg = match video_config.res {
+    let arg = match config.res {
         Some(res) => res.to_args().map_err(|e| {
             match e {
                 ToStrError::BothAreDynamicValue => {
@@ -111,55 +213,30 @@ pub async fn process(params: VideoProcessParams, pb: ProgressBar) -> Result<()> 
     let arg_os_str: Vec<&OsStr> = arg.split_whitespace().map(OsStr::new).collect();
 
     let mut runner = FfmpegCommand::new()
-        .input(input_path)
-        .crf(video_config.crf)
+        .input(stat.path)
+        .crf(config.crf)
         .args(arg_os_str)
         .output(output_path)
         .overwrite()
         .spawn()
         .unwrap();
 
-    let mut input_duration_sec: Option<f64> = None;
-    let mut input_streams: Vec<StreamTypeSpecificData> = Vec::new();
-
     for e in runner.iter().unwrap() {
-        let mut video_streams = input_streams.iter().filter_map(|s| match s {
-            StreamTypeSpecificData::Video(v) => Some(v),
-            _ => None,
-        });
-        let video_stream = video_streams.next();
-
         match e {
-            FfmpegEvent::ParsedDuration(FfmpegDuration { duration, .. }) => {
-                input_duration_sec = Some(duration);
-            }
-            FfmpegEvent::ParsedInputStream(s) => {
-                input_streams.push(s.type_specific_data);
-            }
             FfmpegEvent::Progress(FfmpegProgress {
                 frame: current_frame,
                 ..
             }) => {
-                if input_duration_sec.is_some() && video_stream.is_some() {
-                    let total_frame =
-                        input_duration_sec.unwrap() * video_stream.unwrap().fps.to_f64();
-                    pb.set_length(total_frame as u64);
-                    pb.set_position(current_frame as u64);
-                    pb.set_message("エンコード中...");
+                let total_frame = (stat.duration.as_secs() as f32) * stat.video_stream.fps;
+                pb.set_length(total_frame as u64);
+                pb.set_position(current_frame as u64);
+                pb.set_message("エンコード中...");
+            }
+            FfmpegEvent::Log(level, err) => {
+                if let Err(e) = handle_ffmpeg_event_log(level, err, false) {
+                    return Err(anyhow!(e));
                 }
             }
-            FfmpegEvent::Log(level, err) => match level {
-                LogLevel::Fatal | LogLevel::Error => {
-                    bail!(
-                        "FFmpeg エラーが発生しました: {}",
-                        err.split("[fatal]").last().unwrap()
-                    );
-                }
-                LogLevel::Warning => {
-                    println!("警告: {}", err);
-                }
-                _ => {}
-            },
             _ => {
                 // println!("{:?}", e);
             }

@@ -1,4 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/streetsidesoftware/cspell/main/cspell.schema.json",
-  "words": ["humansize", "indicatif", "vvcnv"]
+  "words": [
+    "ffprobe",
+    "humansize",
+    "indicatif",
+    "vvcnv"
+  ]
 }

@@ -6,7 +6,10 @@ use humansize::{format_size, DECIMAL};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::iter::zip;
 
-use modules::{file, video};
+use modules::{
+    file,
+    video::{self, VideoConfig, VideoRes, VideoStat},
+};
 
 fn get_style(is_done: bool) -> ProgressStyle {
     ProgressStyle::with_template(&format!(
@@ -30,19 +33,15 @@ fn get_style(is_done: bool) -> ProgressStyle {
     .progress_chars("=>-")
 }
 
-async fn process(input_path: &str, crf: u32, pb: ProgressBar) -> Result<()> {
-    let output_path = format!("out/2--crf-{}.mp4", crf);
+async fn process(stat: VideoStat, config: VideoConfig, pb: ProgressBar) -> Result<()> {
+    let output_path = format!("out/2--crf-{}.mp4", config.crf);
+    let crf = config.crf;
 
     video::process(
+        stat,
         video::VideoProcessParams {
-            input_path: input_path.to_string(),
             output_path: output_path.clone(),
-            video_config: video::VideoConfig {
-                res: video::VideoRes::Other(-1, -1).into(),
-                fps: None,
-                crf,
-                has_audio: true,
-            },
+            config,
         },
         pb.clone(),
     )
@@ -67,6 +66,10 @@ async fn process(input_path: &str, crf: u32, pb: ProgressBar) -> Result<()> {
 async fn main() -> Result<()> {
     let input_path = "assets/2.mp4";
 
+    let stat = video::stat(input_path.to_string())
+        .await
+        .expect("元動画の情報の取得に失敗しました");
+
     let crf_iter = (20..40).step_by(10);
 
     let progress = MultiProgress::new();
@@ -77,15 +80,29 @@ async fn main() -> Result<()> {
         pb.set_style(spinner_style.clone());
         pb.set_prefix(format!("CRF: {}", crf));
 
-        tokio::spawn(async move { process(input_path, crf, pb.clone()).await })
+        tokio::spawn({
+            let value = stat.clone();
+            async move {
+                process(
+                    value,
+                    VideoConfig {
+                        res: VideoRes::R1080p.into(),
+                        fps: Some(30_f64),
+                        crf: 32,
+                        has_audio: false,
+                    },
+                    pb.clone(),
+                )
+                .await
+            }
+        })
     });
 
-    let origin_size = file::calc_size(input_path).context("元動画のサイズの取得に失敗しました.")?;
     println!(
         "{}",
         style(format!(
             "元動画のサイズ: {}",
-            format_size(origin_size, DECIMAL)
+            format_size(stat.file_size, DECIMAL)
         ))
         .dim()
     );

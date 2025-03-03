@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use std::{collections::HashMap, fs, os::windows::fs::MetadataExt};
+use std::{fs, io};
 
-pub fn calc_size(path: &str) -> Result<u64> {
-    let metadata = fs::metadata(path).context("ファイルのメタデータを取得できませんでした.")?;
-    Ok(metadata.file_size())
+pub fn calc_size(path: &str) -> Result<u64, io::Error> {
+    let metadata = fs::metadata(path)?;
+    Ok(metadata.len())
 }
 
 // pub fn calc_crf_size() -> Result<HashMap<u32, u64>> {
