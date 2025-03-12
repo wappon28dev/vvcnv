@@ -2,6 +2,7 @@ mod modules;
 
 use anyhow::{anyhow, bail, Context, Result};
 use console::style;
+use ffmpeg_sidecar::event::VideoStream;
 use humansize::{format_size, DECIMAL};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use itertools::iproduct;
@@ -49,15 +50,7 @@ async fn process(stat: VideoStat, config: VideoConfig, pb: ProgressBar) -> Resul
         },
         pb.clone(),
     )
-    .await
-    .with_context(|| {
-        format!(
-            "CRF: {} FPS: {} RES: {:} でのエンコードに失敗しました.",
-            config.crf,
-            config.fps,
-            config.res.to_file_name()
-        )
-    })?;
+    .await?;
 
     let output_size =
         file::calc_size(&output_path).context("出力動画のサイズの取得に失敗しました.")?;
@@ -79,34 +72,45 @@ async fn main() -> Result<()> {
 
     let stat = video::stat(input_path.to_string())
         .await
-        .expect("元動画の情報の取得に失敗しました");
+        .map_err(|e| anyhow!(e).context("元動画の情報取得に失敗しました."))?;
 
-    let crf_iter = (20..=20).step_by(10).collect::<Vec<_>>();
-    let fps_iter = (30..=30).step_by(10).collect::<Vec<_>>();
-    let res_iter = (480..=480)
-        .step_by(240)
-        .map(|w| VideoRes::from_wh(w, -1))
-        .collect::<Vec<_>>();
+    let res_iter = VideoRes::list169();
+    let fps_iter = (30..=30).step_by(30).collect::<Vec<_>>();
+    let crf_iter = (20..=40).step_by(20).collect::<Vec<_>>();
+    // let res_iter = (480..=1080)
+    //     .step_by(240)
+    //     .map(|h| VideoRes::from_wh_dynamic(None, Some(h), stat.video_stream.clone()))
+    //     .map(Result::unwrap)
+    //     .collect::<Vec<_>>();
 
-    let iter_prod = iproduct!(crf_iter.clone(), fps_iter.clone(), res_iter.clone());
+    let iter_prod = iproduct!(res_iter, fps_iter, crf_iter);
 
     let progress = MultiProgress::new();
     let spinner_style = get_style(false);
 
-    let tasks = iter_prod.clone().map(|(crf, fps, res)| {
+    let tasks = iter_prod.clone().map(|(res, fps, crf)| {
         let pb = progress.add(ProgressBar::no_length());
         pb.set_style(spinner_style.clone());
-        pb.set_prefix(format!("CRF: {}, FPS: {}, RES: {:?}", crf, fps, res));
+        pb.set_prefix(format!("RES: {:?}, FPS: {}, CRF: {}", res, fps, crf));
 
         tokio::spawn({
             let value = stat.clone();
             let config = VideoConfig {
                 crf,
                 fps,
-                ..VideoConfig::from_stat(stat.clone())
+                res,
+                has_audio: true,
             };
 
-            async move { process(value, config, pb).await }
+            async move {
+                process(value, config, pb.clone()).await.inspect_err(|e| {
+                    pb.finish_with_message(format!(
+                        "{}: {}",
+                        style("✗ エンコード失敗").red(),
+                        style(&e).red().bright()
+                    ));
+                })
+            }
         })
     });
 
@@ -120,32 +124,31 @@ async fn main() -> Result<()> {
     );
 
     let binding = futures::future::join_all(tasks).await;
-    let results = binding.iter().map(|r| match r {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow!("{:?}", e)),
-        Err(e) => Err(anyhow!("{:?}", e)),
-    });
+    let results = binding
+        .iter()
+        .map(|r| r.as_ref().unwrap())
+        .collect::<Vec<_>>();
 
     println!();
     println!();
-    results.clone().all(|r| r.is_ok()).then(|| {
+    results.clone().iter().all(|r| r.is_ok()).then(|| {
         println!("{}", style("✓ すべて正常にエンコードしました！").green());
     });
-
-    for ((crf, fps, res), result) in zip(iter_prod.clone(), results.clone()) {
-        match result {
-            Ok(()) => {}
-            Err(e) => {
-                bail!(
-                    "CRF: {}, FPS: {}, RES: {:?} でのエンコードに失敗しました: {:?}",
-                    crf,
-                    fps,
-                    res,
-                    e
-                );
-            }
-        }
-    }
+    zip(iter_prod.clone(), results.clone())
+        .clone()
+        .filter(|(_, r)| r.is_err())
+        .for_each(|((res, fps, crf), e)| {
+            eprintln!(
+                "\n{}\n{}:\n{:?}",
+                style("--------------------").dim(),
+                style(format!(
+                    "✗ エンコード失敗 - RES: {:?}, FPS: {}, CRF: {}",
+                    res, fps, crf
+                ))
+                .red(),
+                style(e.as_ref().unwrap_err()).red().bright()
+            );
+        });
 
     Ok(())
 }

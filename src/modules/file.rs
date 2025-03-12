@@ -8,31 +8,19 @@ pub fn calc_size(path: &str) -> Result<u64, io::Error> {
 
 pub fn get_file_name(path: &str) -> (String, String) {
     let file_name = path.split('/').last().unwrap();
-    let file_name_without_ext = file_name.split('.').next().unwrap();
-    (file_name.to_string(), file_name_without_ext.to_string())
+    let mut file_name_parts = file_name.split('.');
+    let file_name_without_ext = file_name_parts.next().unwrap();
+    let ext = file_name_parts.next().unwrap();
+    (file_name_without_ext.to_string(), ext.to_string())
 }
 
-// pub fn calc_crf_size() -> Result<HashMap<u32, u64>> {
-//     let dir = fs::read_dir("./out").context("フォルダーを開けませんでした.")?;
-//     let mut size_map: HashMap<u32, u64> = HashMap::new();
-
-//     for entry in dir {
-//         let entry = entry?;
-//         let metadata = entry.metadata()?;
-//         let file_name = entry.file_name();
-//         let size = metadata.file_size();
-
-//         let crf = file_name.to_str().and_then(|name| {
-//             name.split("--crf-")
-//                 .nth(1)
-//                 .and_then(|s| s.split('.').next())
-//                 .and_then(|s| s.parse::<u32>().ok())
-//         });
-
-//         if let Some(crf) = crf {
-//             size_map.insert(crf, size);
-//         }
-//     }
-
-//     Ok(size_map)
-// }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_get_file_name() {
+        let path = "assets/2.mp4";
+        let (file_name, file_name_without_ext) = super::get_file_name(path);
+        assert_eq!(file_name, "2");
+        assert_eq!(file_name_without_ext, "mp4");
+    }
+}

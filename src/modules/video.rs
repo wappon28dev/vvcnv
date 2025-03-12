@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use core::fmt;
 use ffmpeg_sidecar::{
     command::FfmpegCommand,
     event::{
@@ -7,7 +8,6 @@ use ffmpeg_sidecar::{
     },
 };
 use indicatif::ProgressBar;
-use itertools::iproduct;
 use std::{ffi::OsStr, io, iter, ops, time::Duration};
 
 use super::file;
@@ -22,15 +22,37 @@ pub enum VideoRes {
     R1440p,
     R2160p,
     R4320p,
-    Other(i32, i32),
+    Other(u32, u32),
 }
 
-enum ToStrError {
+#[derive(Debug)]
+pub enum ToStrError {
     BothAreDynamicValue,
 }
 
+impl fmt::Display for ToStrError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ToStrError::BothAreDynamicValue => write!(f, "幅と高さの両方が動的値です."),
+        }
+    }
+}
+
 impl VideoRes {
-    pub fn to_wh(&self) -> (i32, i32) {
+    pub fn list169() -> Vec<Self> {
+        vec![
+            VideoRes::R240p,
+            VideoRes::R360p,
+            VideoRes::R480p,
+            VideoRes::R720p,
+            VideoRes::R1080p,
+            VideoRes::R1440p,
+            VideoRes::R2160p,
+            VideoRes::R4320p,
+        ]
+    }
+
+    pub fn to_wh(&self) -> (u32, u32) {
         match self {
             VideoRes::R240p => (426, 240),
             VideoRes::R360p => (640, 360),
@@ -64,7 +86,7 @@ impl VideoRes {
         format!("{}x{}", w, h)
     }
 
-    pub fn from_wh(width: i32, height: i32) -> Self {
+    pub fn from_wh(width: u32, height: u32) -> Self {
         match (width, height) {
             (426, 240) => VideoRes::R240p,
             (640, 360) => VideoRes::R360p,
@@ -78,14 +100,79 @@ impl VideoRes {
         }
     }
 
-    pub fn to_args(&self) -> Result<String, ToStrError> {
-        let (width, height) = self.to_wh();
+    pub fn from_wh_dynamic(
+        width: Option<i32>,
+        height: Option<i32>,
+        video_stream: VideoStream,
+    ) -> Result<Self, ToStrError> {
+        let VideoStream {
+            width: rw,
+            height: rh,
+            ..
+        } = video_stream;
+        let ratio = rw as f32 / rh as f32;
+        println!("ratio: {}", ratio);
 
-        match (width, height) {
-            (-1, -1) => Err(ToStrError::BothAreDynamicValue),
-            (_, -1) | (-1, _) => Ok(format!("-vf scale={}:{}", width, height)),
-            _ => Ok(format!("-s {}x{}", width, height)),
+        if width.is_none() && height.is_none() {
+            return Err(ToStrError::BothAreDynamicValue);
         }
+
+        let computed_width = match width {
+            Some(w) => w as u32,
+            None => {
+                let h = height.unwrap();
+                (h as f32 * ratio).round() as u32
+            }
+        };
+
+        let computed_height = match height {
+            Some(h) => h as u32,
+            None => {
+                let w = width.unwrap();
+                (w as f32 / ratio).round() as u32
+            }
+        };
+
+        Ok(VideoRes::from_wh(computed_width, computed_height))
+    }
+
+    pub fn to_args(&self) -> String {
+        let (width, height) = self.to_wh();
+        format!("-s {}x{}", width, height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_from_wh_dynamic() {
+        use super::*;
+
+        let video_stream = VideoStream {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            pix_fmt: "yuv420p".to_string(),
+        };
+
+        assert_eq!(
+            VideoRes::from_wh_dynamic(None, Some(720), video_stream.clone())
+                .unwrap()
+                .to_wh(),
+            VideoRes::R720p.to_wh()
+        );
+        assert_eq!(
+            VideoRes::from_wh_dynamic(Some(1280), None, video_stream.clone())
+                .unwrap()
+                .to_wh(),
+            VideoRes::R720p.to_wh()
+        );
+        assert_eq!(
+            VideoRes::from_wh_dynamic(Some(1280), Some(720), video_stream.clone())
+                .unwrap()
+                .to_wh(),
+            VideoRes::R720p.to_wh()
+        );
     }
 }
 
@@ -103,8 +190,22 @@ pub enum VideoStatErr {
     NoVideoStreamFound,
     MultipleVideoStreamFound,
     NoDurationFound,
-    FfmpegError(anyhow::Error),
+    FfmpegError(String),
     FileError(io::Error),
+}
+
+impl fmt::Display for VideoStatErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            VideoStatErr::NoVideoStreamFound => write!(f, "動画ストリームが見つかりません"),
+            VideoStatErr::MultipleVideoStreamFound => {
+                write!(f, "動画ストリームが複数見つかりました")
+            }
+            VideoStatErr::NoDurationFound => write!(f, "動画の長さが取得できません"),
+            VideoStatErr::FfmpegError(e) => write!(f, "ffmpegエラー: {}", e),
+            VideoStatErr::FileError(e) => write!(f, "ファイルエラー: {}", e),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +221,30 @@ pub struct VideoConfigParamsIter {
     crf: Vec<u32>,
 }
 
+#[derive(Debug)]
+pub enum VideoConfigUpScalingErr {
+    Resolution(VideoRes, VideoRes),
+    Fps(u32, u32),
+    HasAudio,
+}
+
+impl fmt::Display for VideoConfigUpScalingErr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let msg = match self {
+            VideoConfigUpScalingErr::Resolution(c, r) => format!(
+                "解像度が元動画より大きいです: {} > {}",
+                c.to_name(),
+                r.to_name()
+            ),
+            VideoConfigUpScalingErr::Fps(c, r) => {
+                format!("FPSが元動画より大きいです: {} > {}", c, r)
+            }
+            VideoConfigUpScalingErr::HasAudio => "音声が元動画に含まれていません".to_string(),
+        };
+        write!(f, "アップスケーリングエラー: {}", msg)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoConfig {
     pub res: VideoRes,
@@ -129,34 +254,63 @@ pub struct VideoConfig {
 }
 
 impl VideoConfig {
-    pub fn from_stat(stat: VideoStat) -> Self {
+    pub fn to_file_name(&self) -> String {
+        format!(
+            "--res-{}--fps-{}--crf-{}",
+            self.res.to_file_name(),
+            self.fps,
+            self.crf
+        )
+    }
+
+    pub fn check_up_scaling(&self, stat: &VideoStat) -> Result<(), VideoConfigUpScalingErr> {
         let VideoStat {
-            video_stream,
+            video_stream:
+                VideoStream {
+                    width: r_width,
+                    height: r_height,
+                    fps: r_fps,
+                    ..
+                },
             audio_streams,
             ..
         } = stat;
 
-        let res = VideoRes::from_wh(video_stream.width as i32, video_stream.height as i32);
-        let fps = video_stream.fps as u32;
-        // ref: https://trac.ffmpeg.org/wiki/Encode/H.264#:~:text=23%20is%20the%20default
-        let crf = 23;
-        let has_audio = !audio_streams.is_empty();
-
-        Self {
+        let VideoConfig {
             res,
-            fps,
-            crf,
+            fps: c_fps,
             has_audio,
-        }
-    }
+            ..
+        } = self;
+        let (c_width, c_height) = res.to_wh();
 
-    pub fn to_file_name(&self) -> String {
-        format!(
-            "--crf-{}--fps-{}--res-{}",
-            self.crf,
-            self.fps,
-            self.res.to_file_name()
-        )
+        if c_width > *r_width || c_height > *r_height {
+            return Err(VideoConfigUpScalingErr::Resolution(
+                self.res.clone(),
+                VideoRes::from_wh(*r_width, *r_height),
+            ));
+        }
+
+        if *c_fps > *r_fps as u32 {
+            return Err(VideoConfigUpScalingErr::Fps(self.fps, *r_fps as u32));
+        }
+
+        if *has_audio && audio_streams.is_empty() {
+            return Err(VideoConfigUpScalingErr::HasAudio);
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            res: VideoRes::R720p,
+            fps: 30,
+            crf: 23,
+            has_audio: true,
+        }
     }
 }
 
@@ -169,20 +323,18 @@ pub fn handle_ffmpeg_event_log(
     level: LogLevel,
     err: String,
     ignore_no_input: bool,
-) -> Result<(), anyhow::Error> {
-    let err_clone = err.clone();
+) -> Result<(), String> {
     match level {
         LogLevel::Fatal | LogLevel::Error => {
-            let err_body = err_clone.split("[fatal] ").last().unwrap();
+            let err_body = err.split("[fatal] ").last().unwrap().to_owned();
             let expected = err_body == "At least one output file must be specified";
 
-            if expected && !ignore_no_input {
-                return Err(anyhow!("入力ファイルが指定されていません"));
+            if expected && ignore_no_input {
+                return Ok(());
             }
 
-            Err(anyhow!(err_body))
+            Err(err_body)
         }
-
         LogLevel::Warning => Ok(()).inspect(|_| {
             println!("警告: {}", err);
         }),
@@ -255,14 +407,11 @@ pub async fn process(stat: VideoStat, params: VideoProcessParams, pb: ProgressBa
         config,
     } = params;
 
-    let arg = config.res.to_args().map_err(|e| {
-        match e {
-            ToStrError::BothAreDynamicValue => {
-                anyhow!("高さと幅のどちらも動的な値 (`-1`) に設定されています. どちらか一方を固定値にしてください.")
-            },
-        }
-    }).context("映像の高さと幅の指定に失敗しました.")?;
+    if let Err(e) = VideoConfig::check_up_scaling(&config, &stat) {
+        return Err(anyhow!(e)).context("エンコード設定に問題があります");
+    }
 
+    let arg = config.res.to_args();
     let arg_os_str: Vec<&OsStr> = arg.split_whitespace().map(OsStr::new).collect();
 
     let mut runner = FfmpegCommand::new()
@@ -287,7 +436,6 @@ pub async fn process(stat: VideoStat, params: VideoProcessParams, pb: ProgressBa
             }
             FfmpegEvent::Log(level, err) => {
                 if let Err(e) = handle_ffmpeg_event_log(level, err, false) {
-                    println!("here!: {:?}", e);
                     return Err(anyhow!(e));
                 }
             }
