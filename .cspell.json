@@ -4,6 +4,8 @@
     "ffprobe",
     "humansize",
     "indicatif",
+    "iproduct",
+    "itertools",
     "vvcnv"
   ]
 }

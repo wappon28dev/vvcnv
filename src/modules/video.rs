@@ -7,10 +7,12 @@ use ffmpeg_sidecar::{
     },
 };
 use indicatif::ProgressBar;
-use std::{ffi::OsStr, io, time::Duration};
+use itertools::iproduct;
+use std::{ffi::OsStr, io, iter, ops, time::Duration};
 
 use super::file;
 
+#[derive(Debug, Clone)]
 pub enum VideoRes {
     R240p,
     R360p,
@@ -56,6 +58,12 @@ impl VideoRes {
         }
     }
 
+    pub fn to_file_name(&self) -> String {
+        let (w, h) = self.to_wh();
+
+        format!("{}x{}", w, h)
+    }
+
     pub fn from_wh(width: i32, height: i32) -> Self {
         match (width, height) {
             (426, 240) => VideoRes::R240p,
@@ -99,11 +107,57 @@ pub enum VideoStatErr {
     FileError(io::Error),
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoConfigParams {
+    pub res: VideoRes,
+    pub fps: u32,
+    pub crf: u32,
+}
+
+pub struct VideoConfigParamsIter {
+    res: Vec<VideoRes>,
+    fps: Vec<u32>,
+    crf: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct VideoConfig {
-    pub res: Option<VideoRes>,
-    pub fps: Option<f64>,
+    pub res: VideoRes,
+    pub fps: u32,
     pub crf: u32,
     pub has_audio: bool,
+}
+
+impl VideoConfig {
+    pub fn from_stat(stat: VideoStat) -> Self {
+        let VideoStat {
+            video_stream,
+            audio_streams,
+            ..
+        } = stat;
+
+        let res = VideoRes::from_wh(video_stream.width as i32, video_stream.height as i32);
+        let fps = video_stream.fps as u32;
+        // ref: https://trac.ffmpeg.org/wiki/Encode/H.264#:~:text=23%20is%20the%20default
+        let crf = 23;
+        let has_audio = !audio_streams.is_empty();
+
+        Self {
+            res,
+            fps,
+            crf,
+            has_audio,
+        }
+    }
+
+    pub fn to_file_name(&self) -> String {
+        format!(
+            "--crf-{}--fps-{}--res-{}",
+            self.crf,
+            self.fps,
+            self.res.to_file_name()
+        )
+    }
 }
 
 pub struct VideoProcessParams {
@@ -116,16 +170,17 @@ pub fn handle_ffmpeg_event_log(
     err: String,
     ignore_no_input: bool,
 ) -> Result<(), anyhow::Error> {
+    let err_clone = err.clone();
     match level {
         LogLevel::Fatal | LogLevel::Error => {
-            let e = err.split("[fatal] ").last().unwrap();
-            let expected = e == "At least one output file must be specified";
+            let err_body = err_clone.split("[fatal] ").last().unwrap();
+            let expected = err_body == "At least one output file must be specified";
 
             if expected && !ignore_no_input {
                 return Err(anyhow!("入力ファイルが指定されていません"));
             }
 
-            Ok(())
+            Err(anyhow!(err_body))
         }
 
         LogLevel::Warning => Ok(()).inspect(|_| {
@@ -200,16 +255,14 @@ pub async fn process(stat: VideoStat, params: VideoProcessParams, pb: ProgressBa
         config,
     } = params;
 
-    let arg = match config.res {
-        Some(res) => res.to_args().map_err(|e| {
-            match e {
-                ToStrError::BothAreDynamicValue => {
-                    anyhow!("高さと幅のどちらも動的な値 (`-1`) に設定されています. どちらか一方を固定値にしてください.")
-                },
-            }
-        }).context("映像の高さと幅の指定に失敗しました.")?,
-        None => "".to_string(),
-    };
+    let arg = config.res.to_args().map_err(|e| {
+        match e {
+            ToStrError::BothAreDynamicValue => {
+                anyhow!("高さと幅のどちらも動的な値 (`-1`) に設定されています. どちらか一方を固定値にしてください.")
+            },
+        }
+    }).context("映像の高さと幅の指定に失敗しました.")?;
+
     let arg_os_str: Vec<&OsStr> = arg.split_whitespace().map(OsStr::new).collect();
 
     let mut runner = FfmpegCommand::new()
@@ -234,6 +287,7 @@ pub async fn process(stat: VideoStat, params: VideoProcessParams, pb: ProgressBa
             }
             FfmpegEvent::Log(level, err) => {
                 if let Err(e) = handle_ffmpeg_event_log(level, err, false) {
+                    println!("here!: {:?}", e);
                     return Err(anyhow!(e));
                 }
             }

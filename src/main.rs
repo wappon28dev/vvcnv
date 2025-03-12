@@ -4,7 +4,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use console::style;
 use humansize::{format_size, DECIMAL};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::iter::zip;
+use itertools::iproduct;
+use std::{
+    iter::{self, zip},
+    ops,
+};
 
 use modules::{
     file,
@@ -34,19 +38,26 @@ fn get_style(is_done: bool) -> ProgressStyle {
 }
 
 async fn process(stat: VideoStat, config: VideoConfig, pb: ProgressBar) -> Result<()> {
-    let output_path = format!("out/2--crf-{}.mp4", config.crf);
-    let crf = config.crf;
+    let (name, ext) = file::get_file_name(&stat.path);
+    let output_path = format!("out/{}{}.{}", name, config.to_file_name(), ext);
 
     video::process(
         stat,
         video::VideoProcessParams {
             output_path: output_path.clone(),
-            config,
+            config: config.clone(),
         },
         pb.clone(),
     )
     .await
-    .with_context(|| format!("CRF {} でのエンコードに失敗しました.", crf))?;
+    .with_context(|| {
+        format!(
+            "CRF: {} FPS: {} RES: {:} でのエンコードに失敗しました.",
+            config.crf,
+            config.fps,
+            config.res.to_file_name()
+        )
+    })?;
 
     let output_size =
         file::calc_size(&output_path).context("出力動画のサイズの取得に失敗しました.")?;
@@ -70,31 +81,32 @@ async fn main() -> Result<()> {
         .await
         .expect("元動画の情報の取得に失敗しました");
 
-    let crf_iter = (20..40).step_by(10);
+    let crf_iter = (20..=20).step_by(10).collect::<Vec<_>>();
+    let fps_iter = (30..=30).step_by(10).collect::<Vec<_>>();
+    let res_iter = (480..=480)
+        .step_by(240)
+        .map(|w| VideoRes::from_wh(w, -1))
+        .collect::<Vec<_>>();
+
+    let iter_prod = iproduct!(crf_iter.clone(), fps_iter.clone(), res_iter.clone());
 
     let progress = MultiProgress::new();
     let spinner_style = get_style(false);
 
-    let tasks = crf_iter.clone().map(|crf| {
+    let tasks = iter_prod.clone().map(|(crf, fps, res)| {
         let pb = progress.add(ProgressBar::no_length());
         pb.set_style(spinner_style.clone());
-        pb.set_prefix(format!("CRF: {}", crf));
+        pb.set_prefix(format!("CRF: {}, FPS: {}, RES: {:?}", crf, fps, res));
 
         tokio::spawn({
             let value = stat.clone();
-            async move {
-                process(
-                    value,
-                    VideoConfig {
-                        res: VideoRes::R1080p.into(),
-                        fps: Some(30_f64),
-                        crf: 32,
-                        has_audio: false,
-                    },
-                    pb.clone(),
-                )
-                .await
-            }
+            let config = VideoConfig {
+                crf,
+                fps,
+                ..VideoConfig::from_stat(stat.clone())
+            };
+
+            async move { process(value, config, pb).await }
         })
     });
 
@@ -120,11 +132,17 @@ async fn main() -> Result<()> {
         println!("{}", style("✓ すべて正常にエンコードしました！").green());
     });
 
-    for (crf, result) in zip(crf_iter.clone(), results.clone()) {
+    for ((crf, fps, res), result) in zip(iter_prod.clone(), results.clone()) {
         match result {
             Ok(()) => {}
             Err(e) => {
-                bail!("[CRF: {}] エンコード失敗: {:?}", crf, e);
+                bail!(
+                    "CRF: {}, FPS: {}, RES: {:?} でのエンコードに失敗しました: {:?}",
+                    crf,
+                    fps,
+                    res,
+                    e
+                );
             }
         }
     }

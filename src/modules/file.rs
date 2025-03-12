@@ -6,6 +6,12 @@ pub fn calc_size(path: &str) -> Result<u64, io::Error> {
     Ok(metadata.len())
 }
 
+pub fn get_file_name(path: &str) -> (String, String) {
+    let file_name = path.split('/').last().unwrap();
+    let file_name_without_ext = file_name.split('.').next().unwrap();
+    (file_name.to_string(), file_name_without_ext.to_string())
+}
+
 // pub fn calc_crf_size() -> Result<HashMap<u32, u64>> {
 //     let dir = fs::read_dir("./out").context("フォルダーを開けませんでした.")?;
 //     let mut size_map: HashMap<u32, u64> = HashMap::new();
